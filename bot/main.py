@@ -61,8 +61,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_exchange_list(update, context)
 
 
+def _build_exchanges_keyboard(exchanges: list, page: int) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("🏦 صرافی", callback_data="noop"),
+        InlineKeyboardButton("💱 حجم معاملات", callback_data="noop"),
+        InlineKeyboardButton("🧮 واحد", callback_data="noop"),
+    ]]
+    start = page * 10
+    end = start + 10
+    for ex in exchanges[start:end]:
+        fa_name = ex.get("fa_name", ex["name"])  # Persian name/transliteration if available
+        name_label = f"🏦 {fa_name} ({ex['name']})"
+        vol_num = ex.get("volume_num_str", "0")
+        vol_unit = ex.get("volume_unit", "")
+        rows.append([
+            InlineKeyboardButton(name_label, callback_data=f"ex:{ex['id']}"),
+            InlineKeyboardButton(f"{vol_num}", callback_data="noop"),
+            InlineKeyboardButton(vol_unit or "—", callback_data="noop"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⏮️ قبلی", callback_data=f"expage:{page-1}"))
+    if end < len(exchanges):
+        nav.append(InlineKeyboardButton("⏭️ بعدی", callback_data=f"expage:{page+1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
 async def send_exchange_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    exchanges = await list_supported_exchanges_sorted_by_volume(max_exchanges=25, timeout_s=20)
+    exchanges = await list_supported_exchanges_sorted_by_volume(max_exchanges=50, timeout_s=25)
     if not exchanges:
         text = "نتوانستم فهرست صرافی‌ها را دریافت کنم. لطفاً بعداً تلاش کنید."
         if update.message:
@@ -71,14 +99,13 @@ async def send_exchange_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.callback_query.edit_message_text(text)
         return
 
-    buttons = []
-    for ex in exchanges:
-        fa_name = ex.get("fa_name", ex["name"])  # Persian name/transliteration if available
-        label = f"{fa_name} ({ex['name']}) — حجم معاملات: {ex['volume_human']} USD"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"ex:{ex['id']}")])
+    user_id = update.effective_user.id if update.effective_user else 0
+    state = _get_user_state(user_id)
+    state["exchanges"] = exchanges
+    state["ex_page"] = "0"
 
-    markup = InlineKeyboardMarkup(buttons)
-    text = "یکی از صرافی‌ها را انتخاب کنید:" 
+    markup = _build_exchanges_keyboard(exchanges, page=0)
+    text = "ستون‌ها: صرافی | حجم معاملات | واحد\nیک صرافی را انتخاب کنید:"
     if update.message:
         await update.message.reply_text(text, reply_markup=markup)
     elif update.callback_query:
@@ -90,25 +117,58 @@ async def on_exchange_selected(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     _, exchange_id = query.data.split(":", 1)
 
-    await query.edit_message_text("در حال دریافت لیست نمادها و قیمت‌ها...")
-    symbols = await list_symbols_with_prices(exchange_id, max_symbols=60)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    sent = await query.message.chat.send_message("در حال دریافت لیست نمادها و قیمت‌ها...")
+    symbols = await list_symbols_with_prices(exchange_id, max_symbols=200)
 
     if not symbols:
-        await query.edit_message_text("نتوانستم نمادها را دریافت کنم. لطفاً صرافی دیگری را انتخاب کنید.")
+        await sent.edit_text("نتوانستم نمادها را دریافت کنم. لطفاً صرافی دیگری را انتخاب کنید.")
         return
 
-    # Build buttons with 1 per row for readability
-    rows = []
-    for s in symbols:
-        fa_name = s.get("fa_name", s["base"])
-        label = f"{fa_name} ({s['symbol']}) — {s['price_human']} دلار"
-        rows.append([InlineKeyboardButton(label, callback_data=f"sym:{exchange_id}:{s['symbol']}")])
+    user_id = query.from_user.id
+    state = _get_user_state(user_id)
+    state["exchange_id"] = exchange_id
+    state["symbols"] = symbols
+    state["sym_page"] = "0"
 
-    markup = InlineKeyboardMarkup(rows)
-    await query.edit_message_text(
-        f"صرافی انتخاب‌شده: {parse_exchange_id(exchange_id)}\nلطفاً نماد/جفت‌ارز را انتخاب کنید:",
+    markup = _build_symbols_keyboard(symbols, exchange_id, page=0)
+    await sent.edit_text(
+        f"🧾 صرافی: {parse_exchange_id(exchange_id)}\nستون‌ها: 🪙 رمز ارز | 🧾 نماد | 💵 قیمت | $\nیکی را انتخاب کنید:",
         reply_markup=markup,
     )
+
+
+def _build_symbols_keyboard(symbols: list, exchange_id: str, page: int) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("🪙 رمز ارز", callback_data="noop"),
+        InlineKeyboardButton("🧾 نماد", callback_data="noop"),
+        InlineKeyboardButton("💵 قیمت", callback_data="noop"),
+        InlineKeyboardButton("$", callback_data="noop"),
+    ]]
+    start = page * 10
+    end = start + 10
+    for s in symbols[start:end]:
+        fa_name = s.get("fa_name", s["base"])
+        price_num = s.get("price_human", "0")
+        rows.append([
+            InlineKeyboardButton(f"🪙 {fa_name}", callback_data=f"sym:{exchange_id}:{s['symbol']}"),
+            InlineKeyboardButton(s['symbol'], callback_data=f"sym:{exchange_id}:{s['symbol']}"),
+            InlineKeyboardButton(price_num, callback_data="noop"),
+            InlineKeyboardButton("$", callback_data="noop"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⏮️ قبلی", callback_data=f"sympage:{exchange_id}:{page-1}"))
+    if end < len(symbols):
+        nav.append(InlineKeyboardButton("⏭️ بعدی", callback_data=f"sympage:{exchange_id}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 بازگشت به صرافی‌ها", callback_data="expage:0")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def on_symbol_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -121,9 +181,10 @@ async def on_symbol_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state["symbol"] = symbol
 
     buttons = [
-        [InlineKeyboardButton("قیمت فعلی", callback_data="act:price")],
-        [InlineKeyboardButton("رسم نمودار", callback_data="act:chart")],
-        [InlineKeyboardButton("دریافت اکسل", callback_data="act:excel")],
+        [InlineKeyboardButton("💰 قیمت فعلی", callback_data="act:price")],
+        [InlineKeyboardButton("📈 رسم نمودار", callback_data="act:chart")],
+        [InlineKeyboardButton("📥 دریافت اکسل", callback_data="act:excel")],
+        [InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")],
     ]
     markup = InlineKeyboardMarkup(buttons)
     await query.edit_message_text(
@@ -151,14 +212,14 @@ async def on_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).astimezone()
         await query.edit_message_text(
-            f"قیمت فعلی {symbol}: {price:,.6f} دلار\nزمان: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+            f"💰 قیمت فعلی {symbol}: {price:,.6f} دلار\n🕒 زمان: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
         )
     elif action == "chart":
         state["awaiting"] = "chart_params_count"
-        await query.edit_message_text("چند کندل می‌خواهید؟ (مثلاً 100)")
+        await query.edit_message_text("📈 چند کندل می‌خواهید؟ (مثلاً 100)")
     elif action == "excel":
         state["awaiting"] = "excel_params_tf"
-        await query.edit_message_text("برای اکسل چه تایم‌فریمی؟ (مثلاً 1m,5m,1h,1d)")
+        await query.edit_message_text("📥 برای اکسل چه تایم‌فریمی؟ (مثلاً 1m,5m,1h,1d)")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,6 +264,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             state.pop("awaiting", None)
             state.pop("chart_count", None)
             state.pop("chart_tf", None)
+            await _show_symbol_menu(update, exchange_id, symbol)
         return
     elif awaiting == "excel_params_tf":
         state["excel_tf"] = text
@@ -237,6 +299,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         finally:
             for k in ["awaiting", "excel_tf", "excel_from", "excel_to"]:
                 state.pop(k, None)
+            await _show_symbol_menu(update, exchange_id, symbol)
         return
 
     # Help text
@@ -255,6 +318,55 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await on_symbol_selected(update, context)
     elif data.startswith("act:"):
         await on_action(update, context)
+    elif data.startswith("expage:"):
+        await on_exchange_page(update, context)
+    elif data.startswith("sympage:"):
+        await on_symbol_page(update, context)
+    elif data == "noop":
+        await query.answer(" ", show_alert=False)
+
+
+async def on_exchange_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":", 1)[1])
+    state = _get_user_state(query.from_user.id)
+    exchanges = state.get("exchanges", [])
+    state["ex_page"] = str(page)
+    markup = _build_exchanges_keyboard(exchanges, page)
+    await query.edit_message_text("ستون‌ها: صرافی | حجم معاملات | واحد\nیک صرافی را انتخاب کنید:", reply_markup=markup)
+
+
+async def on_symbol_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, exchange_id, page_s = query.data.split(":", 2)
+    page = int(page_s)
+    state = _get_user_state(query.from_user.id)
+    symbols = state.get("symbols", [])
+    state["sym_page"] = str(page)
+    markup = _build_symbols_keyboard(symbols, exchange_id, page)
+    await query.edit_message_text(
+        f"🧾 صرافی: {parse_exchange_id(exchange_id)}\nستون‌ها: 🪙 رمز ارز | 🧾 نماد | 💵 قیمت | $\nیکی را انتخاب کنید:",
+        reply_markup=markup,
+    )
+
+
+async def _show_symbol_menu(update: Update, exchange_id: str, symbol: str) -> None:
+    state = _get_user_state(update.effective_user.id)
+    state["exchange_id"] = exchange_id
+    state["symbol"] = symbol
+    buttons = [
+        [InlineKeyboardButton("💰 قیمت فعلی", callback_data="act:price")],
+        [InlineKeyboardButton("📈 رسم نمودار", callback_data="act:chart")],
+        [InlineKeyboardButton("📥 دریافت اکسل", callback_data="act:excel")],
+        [InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")],
+    ]
+    markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        f"نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟",
+        reply_markup=markup,
+    )
 
 
 def build_application() -> Application:
