@@ -28,6 +28,7 @@ from exchange_utils import (
     parse_exchange_id,
     fetch_ohlcv_data,
     get_ticker_details,
+    search_symbol_across_exchanges,
 )
 from charting import render_candlestick_chart_png
 from excel_exporter import export_ohlcv_to_excel
@@ -120,7 +121,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     buttons = [
         [
             InlineKeyboardButton("📊 فهرست صرافی‌ها", callback_data="menu:exchanges"),
-            InlineKeyboardButton("🪙 نمادها", callback_data="menu:symbols"),
+            InlineKeyboardButton("🔍 سرچ رمز ارز", callback_data="menu:search"),
             InlineKeyboardButton("⭐ پنل من", callback_data="panel:open"),
         ]
     ]
@@ -430,6 +431,33 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await _show_symbol_menu(update, exchange_id, symbol)
         return
 
+    # Check if user is searching
+    awaiting = state.get("awaiting")
+    if awaiting == "search_query":
+        query_text = text
+        await update.message.reply_text("🔍 در حال جستجو در صرافی‌ها...")
+        results = await search_symbol_across_exchanges(query_text, max_exchanges=10)
+        if not results:
+            await update.message.reply_text(f"❌ هیچ نتیجه‌ای برای '{query_text}' یافت نشد. لطفاً نام دیگری امتحان کنید.")
+            state.pop("awaiting", None)
+            return
+        
+        # Show results
+        rows = []
+        for r in results[:20]:  # Show max 20 results
+            ex_name = parse_exchange_id(r["exchange_id"])
+            label = f"🪙 {r['symbol']} @ {ex_name} — {r['price_human']} $"
+            rows.append([InlineKeyboardButton(label, callback_data=f"sym:{r['exchange_id']}:{r['symbol']}")])
+        
+        rows.append([InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:home")])
+        markup = InlineKeyboardMarkup(rows)
+        await update.message.reply_text(
+            f"✅ {len(results)} نتیجه برای '{query_text}' یافت شد:\n\nیکی را انتخاب کنید:",
+            reply_markup=markup
+        )
+        state.pop("awaiting", None)
+        return
+
     # Help text
     await update.message.reply_text(
         "دستورها: /start برای شروع.\nپس از انتخاب نماد، می‌توانید ‘توضیحات’ تایپ کنید.")
@@ -444,6 +472,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await show_main_menu(update, context)
     elif data.startswith("menu:exchanges"):
         await send_exchange_list(update, context)
+    elif data.startswith("menu:search"):
+        await on_search_request(update, context)
     elif data.startswith("menu:symbols"):
         # show favorites or ask to choose exchange first
         state = _get_user_state(update.callback_query.from_user.id)
@@ -657,6 +687,19 @@ async def on_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("به علاقه‌مندی‌ها اضافه شد.")
     # show menu again
     await _show_symbol_menu(update, ex, sym)
+
+
+async def on_search_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Request search query from user"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    state = _get_user_state(user_id)
+    state["awaiting"] = "search_query"
+    _persist_user_state(user_id)
+    await query.edit_message_text(
+        "🔍 نام رمز ارز را وارد کنید:\n\nمثال: همستر، btc، اتریوم و...\n\n(می‌توانید نام فارسی یا انگلیسی را وارد کنید)"
+    )
 
 
 async def on_favorite_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
