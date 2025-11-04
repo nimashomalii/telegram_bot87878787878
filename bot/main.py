@@ -48,6 +48,7 @@ USER_STATE: Dict[int, Dict[str, str]] = {}
 
 # Very simple favorites store (per user) persisted in a json file
 FAV_FILE = os.path.join("artifacts", "favorites.json")
+STATE_FILE = os.path.join("artifacts", "user_states.json")
 
 def _load_favorites() -> Dict[str, list]:
     try:
@@ -69,15 +70,47 @@ def _save_favorites(data: Dict[str, list]) -> None:
     except Exception:
         logger.exception("save favorites failed")
 
+def _load_user_states() -> Dict[str, Dict]:
+    try:
+        os.makedirs("artifacts", exist_ok=True)
+        if not os.path.exists(STATE_FILE):
+            return {}
+        import json
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _save_user_state(user_id: str, state: Dict) -> None:
+    try:
+        import json
+        os.makedirs("artifacts", exist_ok=True)
+        all_states = _load_user_states()
+        all_states[user_id] = state
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_states, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("save user state failed")
+
 
 def _get_user_state(user_id: int) -> Dict[str, str]:
     if user_id not in USER_STATE:
-        USER_STATE[user_id] = {}
+        # Try to load from file
+        saved = _load_user_states().get(str(user_id), {})
+        USER_STATE[user_id] = saved if saved else {}
     return USER_STATE[user_id]
+
+def _persist_user_state(user_id: int) -> None:
+    """Save current user state to file"""
+    if user_id in USER_STATE:
+        _save_user_state(str(user_id), USER_STATE[user_id])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    user_id = user.id if user else 0
+    state = _get_user_state(user_id)
+    
     buttons = [
         [
             InlineKeyboardButton("📊 فهرست صرافی‌ها", callback_data="menu:exchanges"),
@@ -85,6 +118,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("⭐ پنل من", callback_data="panel:open"),
         ]
     ]
+    
+    # If user has a saved state with symbol, show continue option
+    if state.get("exchange_id") and state.get("symbol"):
+        buttons.append([InlineKeyboardButton("▶️ ادامه از آخرین مرحله", callback_data=f"sym:{state.get('exchange_id')}:{state.get('symbol')}")])
+    
     await update.message.reply_text(
         f"سلام {user.first_name or ''}!\n"
         "به ربات کریپتو خوش آمدید. از میان گزینه‌های زیر انتخاب کنید.",
@@ -165,6 +203,7 @@ async def on_exchange_selected(update: Update, context: ContextTypes.DEFAULT_TYP
     state["exchange_id"] = exchange_id
     state["symbols"] = symbols
     state["sym_page"] = "0"
+    _persist_user_state(user_id)
 
     markup = _build_symbols_keyboard(symbols, exchange_id, page=0)
     await sent.edit_text(
@@ -210,6 +249,7 @@ async def on_symbol_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state = _get_user_state(query.from_user.id)
     state["exchange_id"] = exchange_id
     state["symbol"] = symbol
+    _persist_user_state(query.from_user.id)
 
     buttons = [
         [InlineKeyboardButton("💰 قیمت فعلی", callback_data="act:price")],
@@ -426,6 +466,7 @@ async def on_exchange_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state = _get_user_state(query.from_user.id)
     exchanges = state.get("exchanges", [])
     state["ex_page"] = str(page)
+    _persist_user_state(query.from_user.id)
     markup = _build_exchanges_keyboard(exchanges, page)
     await query.edit_message_text("ستون‌ها: صرافی | حجم معاملات | واحد\nیک صرافی را انتخاب کنید:", reply_markup=markup)
 
@@ -438,6 +479,7 @@ async def on_symbol_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = _get_user_state(query.from_user.id)
     symbols = state.get("symbols", [])
     state["sym_page"] = str(page)
+    _persist_user_state(query.from_user.id)
     markup = _build_symbols_keyboard(symbols, exchange_id, page)
     await query.edit_message_text(
         f"🧾 صرافی: {parse_exchange_id(exchange_id)}\nستون‌ها: 🪙 رمز ارز | 🧾 نماد | 💵 قیمت | $\nیکی را انتخاب کنید:",
@@ -529,20 +571,26 @@ async def on_excel_range_quick(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _show_symbol_menu(update: Update, exchange_id: str, symbol: str) -> None:
-    state = _get_user_state(update.effective_user.id)
+    user_id = update.effective_user.id if update.effective_user else 0
+    state = _get_user_state(user_id)
     state["exchange_id"] = exchange_id
     state["symbol"] = symbol
+    _persist_user_state(user_id)
     buttons = [
         [InlineKeyboardButton("💰 قیمت فعلی", callback_data="act:price")],
         [InlineKeyboardButton("📈 رسم نمودار", callback_data="act:chart")],
         [InlineKeyboardButton("📥 دریافت اکسل", callback_data="act:excel")],
+        [InlineKeyboardButton("⭐ افزودن به علاقه‌مندی‌ها", callback_data="fav:add")],
+        [InlineKeyboardButton("⭐ پنل من", callback_data="panel:open")],
         [InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")],
     ]
     markup = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        f"نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟",
-        reply_markup=markup,
-    )
+    text = f"📌 نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟"
+    # Support both callback_query and message
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=markup)
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=markup)
 
 
 async def on_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
