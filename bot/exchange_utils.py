@@ -326,3 +326,70 @@ async def fetch_ohlcv_data(exchange_id: str, symbol: str, timeframe: str, limit:
             pass
 
 
+async def search_symbol_across_exchanges(query: str, max_exchanges: int = 10) -> List[Dict]:
+    """
+    Search for a symbol across multiple exchanges.
+    Returns list of dicts with exchange_id, symbol, base, price
+    """
+    query_upper = query.upper().strip()
+    if not query_upper:
+        return []
+    
+    # Popular exchanges to search
+    popular_exchanges = ["binance", "okx", "bybit", "kucoin", "coinbase", "kraken", "bitget", "gate", "huobi", "mexc"]
+    popular_exchanges = popular_exchanges[:max_exchanges]
+    
+    results = []
+    sem = asyncio.Semaphore(3)  # Limit concurrent requests
+    
+    async def search_exchange(ex_id: str) -> List[Dict]:
+        async with sem:
+            ex_cls = getattr(ccxt, ex_id, None)
+            if not ex_cls:
+                return []
+            ex = ex_cls({"enableRateLimit": True, "timeout": 10000})
+            try:
+                await ex.load_markets()
+                matches = []
+                for sym in ex.symbols:
+                    base = sym.split("/")[0].upper()
+                    # Check if query matches base (case-insensitive partial match)
+                    if query_upper in base or base in query_upper:
+                        # Only include USD-quoted pairs
+                        quote = sym.split("/")[1] if "/" in sym else ""
+                        if quote in USD_STABLES:
+                            try:
+                                t = await _safe_call(ex.fetch_ticker(sym), timeout_s=8)
+                                price = float(t.get("last") or 0.0)
+                                matches.append({
+                                    "exchange_id": ex_id,
+                                    "symbol": sym,
+                                    "base": base,
+                                    "price": price,
+                                    "price_human": f"{price:,.6f}",
+                                })
+                            except Exception:
+                                continue
+                return matches
+            except Exception:
+                return []
+            finally:
+                try:
+                    await ex.close()
+                except Exception:
+                    pass
+    
+    # Search all exchanges concurrently
+    tasks = [asyncio.create_task(search_exchange(ex_id)) for ex_id in popular_exchanges]
+    for task in asyncio.as_completed(tasks):
+        try:
+            matches = await task
+            results.extend(matches)
+        except Exception:
+            continue
+    
+    # Sort by exchange popularity (simple) and price
+    exchange_priority = {ex: i for i, ex in enumerate(popular_exchanges)}
+    results.sort(key=lambda x: (exchange_priority.get(x["exchange_id"], 999), -x["price"]))
+    return results[:50]  # Limit to 50 results
+
