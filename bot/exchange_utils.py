@@ -33,7 +33,7 @@ def parse_exchange_id(exchange_id: str) -> str:
 
 
 def _human_usd(num: float) -> str:
-    # Format with B/M/K suffixes
+    # Format with B/M/K suffixes (e.g., 1.2M)
     absn = abs(num)
     if absn >= 1e9:
         return f"{num/1e9:.1f}B"
@@ -42,6 +42,15 @@ def _human_usd(num: float) -> str:
     if absn >= 1e3:
         return f"{num/1e3:.1f}K"
     return f"{num:.0f}"
+
+
+def split_human_amount(human: str) -> (str, str):
+    # returns (number_str, unit_str)
+    if not human:
+        return "0", ""
+    if human[-1] in ["B", "M", "K"]:
+        return human[:-1], human[-1]
+    return human, ""
 
 
 async def _safe_call(coro, timeout_s: float = 15):
@@ -110,6 +119,9 @@ async def list_supported_exchanges_sorted_by_volume(max_exchanges: int = 30, tim
             "fa_name": PERSIAN_NAMES_EX.get(ex_id, ex_id.capitalize()),
             "volume_usd": vol,
             "volume_human": _human_usd(vol),
+            # convenience for UI
+            "volume_num_str": split_human_amount(_human_usd(vol))[0],
+            "volume_unit": split_human_amount(_human_usd(vol))[1],
         })
     return out
 
@@ -121,29 +133,51 @@ async def list_symbols_with_prices(exchange_id: str, max_symbols: int = 80) -> L
         await ex.load_markets()
         symbols = list(ex.symbols or [])
         # Prefer USD-stable quoted pairs
-        def score(sym: str) -> int:
+        def quote_is_usd(sym: str) -> bool:
             parts = sym.split("/")
             quote = parts[1] if len(parts) > 1 else ""
-            return 1 if quote in USD_STABLES else 0
-        symbols.sort(key=score, reverse=True)
-        symbols = symbols[:max_symbols]
+            return quote in USD_STABLES
+
+        # Fetch tickers once where possible
+        tickers = {}
+        try:
+            if ex.has.get("fetchTickers"):
+                tickers = await ex.fetch_tickers()
+        except Exception:
+            tickers = {}
 
         out = []
         for sym in symbols:
             try:
-                t = await ex.fetch_ticker(sym)
+                t = tickers.get(sym)
+                if not t:
+                    t = await ex.fetch_ticker(sym)
                 last = float(t.get("last") or 0.0)
+                qv = t.get("quoteVolume") or 0.0
+                if not qv:
+                    last_tmp = t.get("last") or 0.0
+                    bv = t.get("baseVolume") or 0.0
+                    qv = (last_tmp or 0.0) * (bv or 0.0)
                 base = sym.split("/")[0]
+                vol_h = _human_usd(float(qv or 0.0))
+                num_str, unit = split_human_amount(vol_h)
                 out.append({
                     "symbol": sym,
                     "base": base,
                     "fa_name": PERSIAN_BASES.get(base, base),
                     "price": last,
                     "price_human": f"{last:,.6f}",
+                    "volume_usd": float(qv or 0.0),
+                    "volume_human": vol_h,
+                    "volume_num_str": num_str,
+                    "volume_unit": unit,
+                    "is_usd_quote": quote_is_usd(sym),
                 })
             except Exception:
                 continue
-        return out
+        # Sort by USD quote first, then by volume desc
+        out.sort(key=lambda x: (0 if x["is_usd_quote"] else 1, -x["volume_usd"]))
+        return out[:max_symbols]
     finally:
         try:
             await ex.close()
