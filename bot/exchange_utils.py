@@ -245,29 +245,77 @@ async def get_latest_price(exchange_id: str, symbol: str) -> Tuple[Optional[floa
             pass
 
 
+def timeframe_to_ms(tf: str) -> int:
+    m = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000, "12h": 43_200_000,
+        "1d": 86_400_000, "3d": 259_200_000, "1w": 604_800_000
+    }
+    return m.get(tf, 60_000)
+
+
+async def get_ticker_details(exchange_id: str, symbol: str) -> Dict:
+    ex_cls = getattr(ccxt, exchange_id)
+    ex = ex_cls({"enableRateLimit": True, "timeout": 15000})
+    try:
+        t = await _safe_call(ex.fetch_ticker(symbol), timeout_s=15)
+        last = t.get("last")
+        ts = t.get("timestamp")
+        high = t.get("high")
+        low = t.get("low")
+        chg = t.get("percentage")
+        qv = t.get("quoteVolume") or 0.0
+        if not qv:
+            last_tmp = t.get("last") or 0.0
+            bv = t.get("baseVolume") or 0.0
+            qv = (last_tmp or 0.0) * (bv or 0.0)
+        return {
+            "last": float(last) if last is not None else None,
+            "timestamp": int(ts) if ts is not None else None,
+            "high": float(high) if high is not None else None,
+            "low": float(low) if low is not None else None,
+            "percentage": float(chg) if chg is not None else None,
+            "quoteVolume": float(qv or 0.0),
+        }
+    except Exception:
+        return {}
+    finally:
+        try:
+            await ex.close()
+        except Exception:
+            pass
+
+
 async def fetch_ohlcv_data(exchange_id: str, symbol: str, timeframe: str, limit: int = 200, since: Optional[int] = None, until: Optional[int] = None) -> List[List[float]]:
     ex_cls = getattr(ccxt, exchange_id)
     ex = ex_cls({"enableRateLimit": True})
     try:
         await ex.load_markets()
-        # ccxt does not support until param directly on all exchanges; we page if needed
-        if since is None:
-            data = await ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            return data
-        # paginate by timeframe until reaching until or limit
+        # If no since provided, fetch once
+        if since is None and until is None:
+            return await _safe_call(ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=min(limit, 500)), timeout_s=20)
+
+        # Paginate in chunks of 500, step by timeframe to avoid overlap
+        tf_ms = timeframe_to_ms(timeframe)
         out: List[List[float]] = []
-        next_since = since
+        next_since = since or 0
         while True:
-            batch = await ex.fetch_ohlcv(symbol, timeframe=timeframe, since=next_since, limit=min(500, limit))
+            chunk_limit = min(500, max(1, limit - len(out)))
+            batch = await _safe_call(ex.fetch_ohlcv(symbol, timeframe=timeframe, since=next_since, limit=chunk_limit), timeout_s=25)
             if not batch:
                 break
+            # Ensure strictly increasing and avoid overlap
+            if out and batch[0][0] <= out[-1][0]:
+                # advance by one timeframe to skip overlap
+                next_since = out[-1][0] + tf_ms
+                continue
             out.extend(batch)
             if len(out) >= limit:
                 break
             last_ts = batch[-1][0]
             if until is not None and last_ts >= until:
                 break
-            next_since = last_ts + 1
+            next_since = last_ts + tf_ms
         if until is not None:
             out = [row for row in out if row[0] <= until]
         return out[:limit]
