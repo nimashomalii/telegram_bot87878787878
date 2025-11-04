@@ -27,6 +27,7 @@ from exchange_utils import (
     get_latest_price,
     parse_exchange_id,
     fetch_ohlcv_data,
+    get_ticker_details,
 )
 from charting import render_candlestick_chart_png
 from excel_exporter import export_ohlcv_to_excel
@@ -45,6 +46,29 @@ logger = logging.getLogger(__name__)
 # Simple in-memory per-user state for multi-step prompts
 USER_STATE: Dict[int, Dict[str, str]] = {}
 
+# Very simple favorites store (per user) persisted in a json file
+FAV_FILE = os.path.join("artifacts", "favorites.json")
+
+def _load_favorites() -> Dict[str, list]:
+    try:
+        os.makedirs("artifacts", exist_ok=True)
+        if not os.path.exists(FAV_FILE):
+            return {}
+        import json
+        with open(FAV_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _save_favorites(data: Dict[str, list]) -> None:
+    try:
+        import json
+        os.makedirs("artifacts", exist_ok=True)
+        with open(FAV_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("save favorites failed")
+
 
 def _get_user_state(user_id: int) -> Dict[str, str]:
     if user_id not in USER_STATE:
@@ -54,9 +78,12 @@ def _get_user_state(user_id: int) -> Dict[str, str]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    buttons = [[InlineKeyboardButton("⭐ پنل من", callback_data="panel:open")]]
     await update.message.reply_text(
         f"سلام {user.first_name or ''}!\n"
-        "به ربات کریپتو خوش آمدید. صرافی مورد نظر را انتخاب کنید تا شروع کنیم.")
+        "به ربات کریپتو خوش آمدید. یکی از گزینه‌ها را انتخاب کنید.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
     await send_exchange_list(update, context)
 
@@ -184,6 +211,8 @@ async def on_symbol_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("💰 قیمت فعلی", callback_data="act:price")],
         [InlineKeyboardButton("📈 رسم نمودار", callback_data="act:chart")],
         [InlineKeyboardButton("📥 دریافت اکسل", callback_data="act:excel")],
+        [InlineKeyboardButton("⭐ افزودن به علاقه‌مندی‌ها", callback_data="fav:add")],
+        [InlineKeyboardButton("⭐ لیست علاقه‌مندی‌ها", callback_data="panel:open")],
         [InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")],
     ]
     markup = InlineKeyboardMarkup(buttons)
@@ -206,14 +235,29 @@ async def on_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if action == "price":
-        price, ts = await get_latest_price(exchange_id, symbol)
+        t = await get_ticker_details(exchange_id, symbol)
+        price = t.get("last")
+        ts = t.get("timestamp")
         if price is None:
             await query.edit_message_text("نتوانستم قیمت را دریافت کنم.")
             return
-        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).astimezone()
-        await query.edit_message_text(
-            f"💰 قیمت فعلی {symbol}: {price:,.6f} دلار\n🕒 زمان: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-        )
+        dt = datetime.fromtimestamp((ts or 0) / 1000, tz=timezone.utc).astimezone()
+        hi = t.get("high")
+        lo = t.get("low")
+        ch = t.get("percentage")
+        qv = t.get("quoteVolume", 0.0)
+        lines = [
+            f"📌 نماد: <b>{symbol}</b>",
+            f"💰 قیمت: <b>{price:,.6f}</b> دلار",
+            f"📈 بیشینه 24ساعته: {hi if hi is not None else '—'}",
+            f"📉 کمینه 24ساعته: {lo if lo is not None else '—'}",
+            f"📊 تغییر: {ch:.2f}%" if ch is not None else None,
+            f"💵 حجم 24ساعته: {qv:,.0f} دلار",
+            f"🕒 زمان: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        ]
+        msg = "\n".join([x for x in lines if x is not None])
+        buttons = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")]]
+        await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
     elif action == "chart":
         state["awaiting"] = "chart_params_count"
         await query.edit_message_text("📈 چند کندل می‌خواهید؟ (مثلاً 100)")
@@ -322,6 +366,10 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await on_exchange_page(update, context)
     elif data.startswith("sympage:"):
         await on_symbol_page(update, context)
+    elif data.startswith("panel:" ):
+        await on_panel(update, context)
+    elif data.startswith("fav:" ):
+        await on_favorite(update, context)
     elif data == "noop":
         await query.answer(" ", show_alert=False)
 
@@ -367,6 +415,48 @@ async def _show_symbol_menu(update: Update, exchange_id: str, symbol: str) -> No
         f"نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟",
         reply_markup=markup,
     )
+
+
+async def on_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    favs = _load_favorites().get(user_id, [])
+    rows = []
+    if favs:
+        rows.append([InlineKeyboardButton("⭐ علاقه‌مندی‌ها", callback_data="noop")])
+        for item in favs[:10]:
+            ex = item.get("exchange")
+            sym = item.get("symbol")
+            rows.append([InlineKeyboardButton(f"{sym} @ {ex}", callback_data=f"sym:{ex}:{sym}")])
+    else:
+        rows.append([InlineKeyboardButton("(هنوز موردی اضافه نشده)", callback_data="noop")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="expage:0")])
+    await query.edit_message_text("⭐ پنل کاربری شما:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def on_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    state = _get_user_state(query.from_user.id)
+    ex = state.get("exchange_id")
+    sym = state.get("symbol")
+    data = _load_favorites()
+    lst = data.get(user_id, [])
+    # toggle add/remove
+    if any(x.get("exchange") == ex and x.get("symbol") == sym for x in lst):
+        lst = [x for x in lst if not (x.get("exchange") == ex and x.get("symbol") == sym)]
+        data[user_id] = lst
+        _save_favorites(data)
+        await query.edit_message_text("از علاقه‌مندی‌ها حذف شد.")
+    else:
+        lst.append({"exchange": ex, "symbol": sym})
+        data[user_id] = lst
+        _save_favorites(data)
+        await query.edit_message_text("به علاقه‌مندی‌ها اضافه شد.")
+    # show menu again
+    await _show_symbol_menu(update, ex, sym)
 
 
 def build_application() -> Application:
