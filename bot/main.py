@@ -106,9 +106,15 @@ def _persist_user_state(user_id: int) -> None:
         _save_user_state(str(user_id), USER_STATE[user_id])
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show main menu - can be called from start or callback"""
     user = update.effective_user
-    user_id = user.id if user else 0
+    if not user:
+        user = update.callback_query.from_user if update.callback_query else None
+    if not user:
+        return
+    
+    user_id = user.id
     state = _get_user_state(user_id)
     
     buttons = [
@@ -123,11 +129,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if state.get("exchange_id") and state.get("symbol"):
         buttons.append([InlineKeyboardButton("▶️ ادامه از آخرین مرحله", callback_data=f"sym:{state.get('exchange_id')}:{state.get('symbol')}")])
     
-    await update.message.reply_text(
-        f"سلام {user.first_name or ''}!\n"
-        "به ربات کریپتو خوش آمدید. از میان گزینه‌های زیر انتخاب کنید.",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    text = f"سلام {user.first_name or ''}!\nبه ربات کریپتو خوش آمدید. از میان گزینه‌های زیر انتخاب کنید."
+    markup = InlineKeyboardMarkup(buttons)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=markup)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_main_menu(update, context)
 
 
 def _build_exchanges_keyboard(exchanges: list, page: int) -> InlineKeyboardMarkup:
@@ -155,6 +167,8 @@ def _build_exchanges_keyboard(exchanges: list, page: int) -> InlineKeyboardMarku
         nav.append(InlineKeyboardButton("⏭️ بعدی", callback_data=f"expage:{page+1}"))
     if nav:
         rows.append(nav)
+    # Add back to main menu button
+    rows.append([InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -426,7 +440,9 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not query or not query.data:
         return
     data = query.data
-    if data.startswith("menu:exchanges"):
+    if data.startswith("menu:home"):
+        await show_main_menu(update, context)
+    elif data.startswith("menu:exchanges"):
         await send_exchange_list(update, context)
     elif data.startswith("menu:symbols"):
         # show favorites or ask to choose exchange first
@@ -447,6 +463,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await on_symbol_page(update, context)
     elif data.startswith("panel:" ):
         await on_panel(update, context)
+    elif data.startswith("fav:remove:"):
+        await on_favorite_remove(update, context)
     elif data.startswith("fav:" ):
         await on_favorite(update, context)
     elif data.startswith("tf:chart:"):
@@ -600,14 +618,20 @@ async def on_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     favs = _load_favorites().get(user_id, [])
     rows = []
     if favs:
-        rows.append([InlineKeyboardButton("⭐ علاقه‌مندی‌ها", callback_data="noop")])
+        rows.append([
+            InlineKeyboardButton("⭐ علاقه‌مندی‌ها", callback_data="noop"),
+            InlineKeyboardButton("🗑️ حذف", callback_data="noop")
+        ])
         for item in favs[:10]:
             ex = item.get("exchange")
             sym = item.get("symbol")
-            rows.append([InlineKeyboardButton(f"{sym} @ {ex}", callback_data=f"sym:{ex}:{sym}")])
+            rows.append([
+                InlineKeyboardButton(f"🪙 {sym} @ {ex}", callback_data=f"sym:{ex}:{sym}"),
+                InlineKeyboardButton("❌", callback_data=f"fav:remove:{ex}:{sym}")
+            ])
     else:
         rows.append([InlineKeyboardButton("(هنوز موردی اضافه نشده)", callback_data="noop")])
-    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="expage:0")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:home")])
     await query.edit_message_text("⭐ پنل کاربری شما:", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -633,6 +657,23 @@ async def on_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("به علاقه‌مندی‌ها اضافه شد.")
     # show menu again
     await _show_symbol_menu(update, ex, sym)
+
+
+async def on_favorite_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove favorite from panel"""
+    query = update.callback_query
+    await query.answer()
+    _, _, exchange_id, symbol = query.data.split(":", 3)
+    user_id = str(query.from_user.id)
+    data = _load_favorites()
+    lst = data.get(user_id, [])
+    # Remove the item
+    lst = [x for x in lst if not (x.get("exchange") == exchange_id and x.get("symbol") == symbol)]
+    data[user_id] = lst
+    _save_favorites(data)
+    await query.answer("✅ از علاقه‌مندی‌ها حذف شد.", show_alert=True)
+    # Refresh panel
+    await on_panel(update, context)
 
 
 def build_application() -> Application:
