@@ -78,14 +78,18 @@ def _get_user_state(user_id: int) -> Dict[str, str]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    buttons = [[InlineKeyboardButton("⭐ پنل من", callback_data="panel:open")]]
+    buttons = [
+        [
+            InlineKeyboardButton("📊 فهرست صرافی‌ها", callback_data="menu:exchanges"),
+            InlineKeyboardButton("🪙 نمادها", callback_data="menu:symbols"),
+            InlineKeyboardButton("⭐ پنل من", callback_data="panel:open"),
+        ]
+    ]
     await update.message.reply_text(
         f"سلام {user.first_name or ''}!\n"
-        "به ربات کریپتو خوش آمدید. یکی از گزینه‌ها را انتخاب کنید.",
+        "به ربات کریپتو خوش آمدید. از میان گزینه‌های زیر انتخاب کنید.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
-
-    await send_exchange_list(update, context)
 
 
 def _build_exchanges_keyboard(exchanges: list, page: int) -> InlineKeyboardMarkup:
@@ -262,8 +266,12 @@ async def on_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["awaiting"] = "chart_params_count"
         await query.edit_message_text("📈 چند کندل می‌خواهید؟ (مثلاً 100)")
     elif action == "excel":
+        # show timeframe buttons
         state["awaiting"] = "excel_params_tf"
-        await query.edit_message_text("📥 برای اکسل چه تایم‌فریمی؟ (مثلاً 1m,5m,1h,1d)")
+        tfs = ["1m","5m","15m","1h","4h","1d"]
+        rows = [[InlineKeyboardButton(tf, callback_data=f"tf:excel:{tf}") for tf in tfs]]
+        rows.append([InlineKeyboardButton("❌ انصراف", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")])
+        await query.edit_message_text("📥 برای اکسل یکی از تایم‌فریم‌ها را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -289,7 +297,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("عدد نامعتبر است. دوباره تعداد کندل‌ها را وارد کنید.")
             return
         state["awaiting"] = "chart_params_tf"
-        await update.message.reply_text("چه تایم‌فریمی؟ (1m,5m,15m,1h,4h,1d)")
+        # show timeframe buttons instead of text
+        tfs = ["1m","5m","15m","1h","4h","1d"]
+        rows = [[InlineKeyboardButton(tf, callback_data=f"tf:chart:{tf}") for tf in tfs]]
+        await update.message.reply_text("📈 تایم‌فریم را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
         return
     elif awaiting == "chart_params_tf":
         tf = text
@@ -313,7 +324,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif awaiting == "excel_params_tf":
         state["excel_tf"] = text
         state["awaiting"] = "excel_params_from"
-        await update.message.reply_text("از چه تاریخی؟ (YYYY-MM-DD)")
+        quick = [
+            InlineKeyboardButton("⏱️ 7 روز اخیر", callback_data="rng:excel:7d"),
+            InlineKeyboardButton("📅 30 روز اخیر", callback_data="rng:excel:30d"),
+        ]
+        await update.message.reply_text(
+            "از چه تاریخی؟ (فرمت: YYYY-MM-DD)\nمثال: 2024-01-01",
+            reply_markup=InlineKeyboardMarkup([quick])
+        )
         return
     elif awaiting == "excel_params_from":
         state["excel_from"] = text
@@ -356,7 +374,16 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not query or not query.data:
         return
     data = query.data
-    if data.startswith("ex:"):
+    if data.startswith("menu:exchanges"):
+        await send_exchange_list(update, context)
+    elif data.startswith("menu:symbols"):
+        # show favorites or ask to choose exchange first
+        state = _get_user_state(update.callback_query.from_user.id)
+        if state.get("exchange_id") and state.get("symbols"):
+            await on_symbol_page(update, context)
+        else:
+            await update.callback_query.answer("ابتدا یک صرافی انتخاب کنید.", show_alert=True)
+    elif data.startswith("ex:"):
         await on_exchange_selected(update, context)
     elif data.startswith("sym:"):
         await on_symbol_selected(update, context)
@@ -370,6 +397,12 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await on_panel(update, context)
     elif data.startswith("fav:" ):
         await on_favorite(update, context)
+    elif data.startswith("tf:chart:"):
+        await on_chart_tf_selected(update, context)
+    elif data.startswith("tf:excel:"):
+        await on_excel_tf_selected(update, context)
+    elif data.startswith("rng:excel:"):
+        await on_excel_range_quick(update, context)
     elif data == "noop":
         await query.answer(" ", show_alert=False)
 
@@ -398,6 +431,81 @@ async def on_symbol_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🧾 صرافی: {parse_exchange_id(exchange_id)}\nستون‌ها: 🪙 رمز ارز | 🧾 نماد | 💵 قیمت | $\nیکی را انتخاب کنید:",
         reply_markup=markup,
     )
+
+
+async def on_chart_tf_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    tf = query.data.split(":", 2)[2]
+    state = _get_user_state(query.from_user.id)
+    state["chart_tf"] = tf
+    exchange_id = state.get("exchange_id")
+    symbol = state.get("symbol")
+    count = int(state.get("chart_count", "200"))
+    await query.edit_message_text("در حال دریافت داده‌ها و رسم نمودار...")
+    try:
+        ohlcv = await fetch_ohlcv_data(exchange_id, symbol, tf, limit=count)
+        img_path = await render_candlestick_chart_png(symbol, tf, ohlcv)
+        with open(img_path, "rb") as f:
+            await query.message.reply_photo(photo=InputFile(f), caption=f"📈 نمودار {symbol} در تایم‌فریم {tf}")
+    except Exception:
+        logger.exception("chart error")
+        await query.message.reply_text("خطا در رسم نمودار. دوباره تلاش کنید.")
+    finally:
+        state.pop("awaiting", None)
+        state.pop("chart_count", None)
+        state.pop("chart_tf", None)
+        await _show_symbol_menu(update, exchange_id, symbol)
+
+
+async def on_excel_tf_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    tf = query.data.split(":", 2)[2]
+    state = _get_user_state(query.from_user.id)
+    state["excel_tf"] = tf
+    # ask for dates with quick range
+    quick = [
+        InlineKeyboardButton("⏱️ 7 روز اخیر", callback_data="rng:excel:7d"),
+        InlineKeyboardButton("📅 30 روز اخیر", callback_data="rng:excel:30d"),
+    ]
+    await query.edit_message_text(
+        "از چه تاریخی؟ (فرمت: YYYY-MM-DD)\nمثال: 2024-01-01",
+        reply_markup=InlineKeyboardMarkup([quick])
+    )
+    state["awaiting"] = "excel_params_from"
+
+
+async def on_excel_range_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    rng = query.data.split(":", 2)[2]
+    state = _get_user_state(query.from_user.id)
+    exchange_id = state.get("exchange_id")
+    symbol = state.get("symbol")
+    tf = state.get("excel_tf", "1h")
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    if rng == "7d":
+        since_ms = now_ms - 7 * 24 * 60 * 60 * 1000
+    else:
+        since_ms = now_ms - 30 * 24 * 60 * 60 * 1000
+    await query.edit_message_text("در حال تهیه فایل اکسل...")
+    try:
+        # estimate candle count and cap
+        from exchange_utils import timeframe_to_ms
+        tf_ms = timeframe_to_ms(tf)
+        expected = min(10000, max(500, (now_ms - since_ms) // tf_ms + 5))
+        ohlcv = await fetch_ohlcv_data(exchange_id, symbol, tf, since=since_ms, until=now_ms, limit=expected)
+        path = await export_ohlcv_to_excel(symbol, tf, ohlcv)
+        with open(path, "rb") as f:
+            await query.message.reply_document(document=InputFile(f), filename=os.path.basename(path), caption="فایل اکسل OHLCV")
+    except Exception:
+        logger.exception("excel quick range error")
+        await query.message.reply_text("خطا در تولید فایل اکسل با بازه سریع.")
+    finally:
+        for k in ["awaiting", "excel_tf", "excel_from", "excel_to"]:
+            state.pop(k, None)
+        await _show_symbol_menu(update, exchange_id, symbol)
 
 
 async def _show_symbol_menu(update: Update, exchange_id: str, symbol: str) -> None:
