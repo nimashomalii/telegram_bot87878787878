@@ -351,13 +351,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await update.message.reply_text("در حال تهیه فایل اکسل...")
         try:
-            ohlcv = await fetch_ohlcv_data(exchange_id, symbol, tf, since=since_ms, until=to_ms, limit=2000)
-            path = await export_ohlcv_to_excel(symbol, tf, ohlcv)
-            with open(path, "rb") as f:
-                await update.message.reply_document(document=InputFile(f), filename=os.path.basename(path), caption="فایل اکسل OHLCV")
+            # estimate limit based on timeframe and date range
+            from exchange_utils import timeframe_to_ms
+            tf_ms = timeframe_to_ms(tf)
+            expected = min(10000, max(500, (to_ms - since_ms) // tf_ms + 10))
+            ohlcv = await fetch_ohlcv_data(exchange_id, symbol, tf, since=since_ms, until=to_ms, limit=expected)
+            if not ohlcv:
+                await update.message.reply_text("❌ هیچ داده‌ای برای بازه زمانی انتخاب شده یافت نشد. لطفاً بازه دیگری را امتحان کنید.")
+            else:
+                path = await export_ohlcv_to_excel(symbol, tf, ohlcv)
+                with open(path, "rb") as f:
+                    await update.message.reply_document(document=InputFile(f), filename=os.path.basename(path), caption=f"📥 فایل اکسل OHLCV ({len(ohlcv)} کندل)")
+        except ValueError as e:
+            if "No OHLCV" in str(e):
+                await update.message.reply_text("❌ هیچ داده‌ای برای بازه زمانی انتخاب شده یافت نشد.")
+            else:
+                raise
         except Exception:
             logger.exception("excel error")
-            await update.message.reply_text("خطا در تولید فایل اکسل.")
+            await update.message.reply_text("❌ خطا در تولید فایل اکسل. لطفاً دوباره تلاش کنید.")
         finally:
             for k in ["awaiting", "excel_tf", "excel_from", "excel_to"]:
                 state.pop(k, None)
@@ -496,12 +508,20 @@ async def on_excel_range_quick(update: Update, context: ContextTypes.DEFAULT_TYP
         tf_ms = timeframe_to_ms(tf)
         expected = min(10000, max(500, (now_ms - since_ms) // tf_ms + 5))
         ohlcv = await fetch_ohlcv_data(exchange_id, symbol, tf, since=since_ms, until=now_ms, limit=expected)
-        path = await export_ohlcv_to_excel(symbol, tf, ohlcv)
-        with open(path, "rb") as f:
-            await query.message.reply_document(document=InputFile(f), filename=os.path.basename(path), caption="فایل اکسل OHLCV")
+        if not ohlcv:
+            await query.message.reply_text("❌ هیچ داده‌ای برای بازه زمانی انتخاب شده یافت نشد. لطفاً بازه دیگری را امتحان کنید.")
+        else:
+            path = await export_ohlcv_to_excel(symbol, tf, ohlcv)
+            with open(path, "rb") as f:
+                await query.message.reply_document(document=InputFile(f), filename=os.path.basename(path), caption=f"📥 فایل اکسل OHLCV ({len(ohlcv)} کندل)")
+    except ValueError as e:
+        if "No OHLCV" in str(e):
+            await query.message.reply_text("❌ هیچ داده‌ای برای بازه زمانی انتخاب شده یافت نشد.")
+        else:
+            raise
     except Exception:
         logger.exception("excel quick range error")
-        await query.message.reply_text("خطا در تولید فایل اکسل با بازه سریع.")
+        await query.message.reply_text("❌ خطا در تولید فایل اکسل با بازه سریع. لطفاً دوباره تلاش کنید.")
     finally:
         for k in ["awaiting", "excel_tf", "excel_from", "excel_to"]:
             state.pop(k, None)
