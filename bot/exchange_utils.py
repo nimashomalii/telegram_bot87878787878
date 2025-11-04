@@ -126,9 +126,9 @@ async def list_supported_exchanges_sorted_by_volume(max_exchanges: int = 30, tim
     return out
 
 
-async def list_symbols_with_prices(exchange_id: str, max_symbols: int = 80) -> List[Dict]:
+async def list_symbols_with_prices(exchange_id: str, max_symbols: int = 100) -> List[Dict]:
     ex_cls = getattr(ccxt, exchange_id)
-    ex = ex_cls({"enableRateLimit": True})
+    ex = ex_cls({"enableRateLimit": True, "timeout": 15000})
     try:
         await ex.load_markets()
         symbols = list(ex.symbols or [])
@@ -138,46 +138,89 @@ async def list_symbols_with_prices(exchange_id: str, max_symbols: int = 80) -> L
             quote = parts[1] if len(parts) > 1 else ""
             return quote in USD_STABLES
 
-        # Fetch tickers once where possible
-        tickers = {}
-        try:
-            if ex.has.get("fetchTickers"):
-                tickers = await ex.fetch_tickers()
-        except Exception:
-            tickers = {}
-
-        out = []
-        for sym in symbols:
+        # Fast path: fetch all tickers once (if supported)
+        if ex.has.get("fetchTickers"):
             try:
-                t = tickers.get(sym)
-                if not t:
-                    t = await ex.fetch_ticker(sym)
-                last = float(t.get("last") or 0.0)
-                qv = t.get("quoteVolume") or 0.0
-                if not qv:
-                    last_tmp = t.get("last") or 0.0
-                    bv = t.get("baseVolume") or 0.0
-                    qv = (last_tmp or 0.0) * (bv or 0.0)
-                base = sym.split("/")[0]
-                vol_h = _human_usd(float(qv or 0.0))
-                num_str, unit = split_human_amount(vol_h)
-                out.append({
-                    "symbol": sym,
-                    "base": base,
-                    "fa_name": PERSIAN_BASES.get(base, base),
-                    "price": last,
-                    "price_human": f"{last:,.6f}",
-                    "volume_usd": float(qv or 0.0),
-                    "volume_human": vol_h,
-                    "volume_num_str": num_str,
-                    "volume_unit": unit,
-                    "is_usd_quote": quote_is_usd(sym),
-                })
+                tickers = await _safe_call(ex.fetch_tickers(), timeout_s=20)
             except Exception:
-                continue
-        # Sort by USD quote first, then by volume desc
-        out.sort(key=lambda x: (0 if x["is_usd_quote"] else 1, -x["volume_usd"]))
-        return out[:max_symbols]
+                tickers = {}
+
+            out: List[Dict] = []
+            for sym, t in tickers.items():
+                # only include symbols known in markets and having USD-like quote
+                if sym not in ex.markets:
+                    continue
+                if not quote_is_usd(sym):
+                    continue
+                try:
+                    last = float(t.get("last") or 0.0)
+                    qv = t.get("quoteVolume") or 0.0
+                    if not qv:
+                        last_tmp = t.get("last") or 0.0
+                        bv = t.get("baseVolume") or 0.0
+                        qv = (last_tmp or 0.0) * (bv or 0.0)
+                    base = sym.split("/")[0]
+                    vol_h = _human_usd(float(qv or 0.0))
+                    num_str, unit = split_human_amount(vol_h)
+                    out.append({
+                        "symbol": sym,
+                        "base": base,
+                        "fa_name": PERSIAN_BASES.get(base, base),
+                        "price": last,
+                        "price_human": f"{last:,.6f}",
+                        "volume_usd": float(qv or 0.0),
+                        "volume_human": vol_h,
+                        "volume_num_str": num_str,
+                        "volume_unit": unit,
+                        "is_usd_quote": True,
+                    })
+                except Exception:
+                    continue
+            # Sort by volume desc, take top max_symbols
+            out.sort(key=lambda x: -x["volume_usd"])
+            return out[:max_symbols]
+
+        # Slow path: fetch a subset concurrently (USD-quoted only)
+        cand = [s for s in symbols if quote_is_usd(s)]
+        cand = cand[:200]  # cap to limit API usage
+
+        sem = asyncio.Semaphore(10)
+        async def fetch_one(sym: str) -> Optional[Dict]:
+            async with sem:
+                try:
+                    t = await _safe_call(ex.fetch_ticker(sym), timeout_s=12)
+                    last = float(t.get("last") or 0.0)
+                    qv = t.get("quoteVolume") or 0.0
+                    if not qv:
+                        last_tmp = t.get("last") or 0.0
+                        bv = t.get("baseVolume") or 0.0
+                        qv = (last_tmp or 0.0) * (bv or 0.0)
+                    base = sym.split("/")[0]
+                    vol_h = _human_usd(float(qv or 0.0))
+                    num_str, unit = split_human_amount(vol_h)
+                    return {
+                        "symbol": sym,
+                        "base": base,
+                        "fa_name": PERSIAN_BASES.get(base, base),
+                        "price": last,
+                        "price_human": f"{last:,.6f}",
+                        "volume_usd": float(qv or 0.0),
+                        "volume_human": vol_h,
+                        "volume_num_str": num_str,
+                        "volume_unit": unit,
+                        "is_usd_quote": True,
+                    }
+                except Exception:
+                    return None
+
+        tasks = [asyncio.create_task(fetch_one(s)) for s in cand]
+        results = []
+        for t in asyncio.as_completed(tasks):
+            r = await t
+            if r:
+                results.append(r)
+        results.sort(key=lambda x: -x["volume_usd"])
+        return results[:max_symbols]
     finally:
         try:
             await ex.close()
