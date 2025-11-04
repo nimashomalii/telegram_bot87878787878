@@ -73,4 +73,3 @@ async def get_coin_details(exchange_id: str, symbol: str) -> str:
     return text
 
 
-
