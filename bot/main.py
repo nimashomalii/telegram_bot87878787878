@@ -218,6 +218,9 @@ async def on_exchange_selected(update: Update, context: ContextTypes.DEFAULT_TYP
     state["exchange_id"] = exchange_id
     state["symbols"] = symbols
     state["sym_page"] = "0"
+    # Clear search state when coming from exchange selection
+    state.pop("search_query", None)
+    state.pop("search_results", None)
     _persist_user_state(user_id)
 
     markup = _build_symbols_keyboard(symbols, exchange_id, page=0)
@@ -264,6 +267,11 @@ async def on_symbol_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state = _get_user_state(query.from_user.id)
     state["exchange_id"] = exchange_id
     state["symbol"] = symbol
+    
+    # Track navigation history
+    nav_history = state.get("nav_history", [])
+    nav_history.append({"type": "symbol", "exchange_id": exchange_id, "symbol": symbol})
+    state["nav_history"] = nav_history[-5:]  # Keep last 5 steps
     _persist_user_state(query.from_user.id)
 
     buttons = [
@@ -272,11 +280,22 @@ async def on_symbol_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("📥 دریافت اکسل", callback_data="act:excel")],
         [InlineKeyboardButton("⭐ افزودن به علاقه‌مندی‌ها", callback_data="fav:add")],
         [InlineKeyboardButton("⭐ لیست علاقه‌مندی‌ها", callback_data="panel:open")],
-        [InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")],
     ]
+    
+    # Add back buttons based on navigation history
+    back_buttons = []
+    if state.get("search_query"):
+        # Came from search
+        back_buttons.append([InlineKeyboardButton("🔙 بازگشت به نتایج جستجو", callback_data="nav:search_results")])
+    if state.get("exchange_id") and state.get("symbols"):
+        # Came from exchange symbols list
+        back_buttons.append([InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")])
+    back_buttons.append([InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="menu:home")])
+    
+    buttons.extend(back_buttons)
     markup = InlineKeyboardMarkup(buttons)
     await query.edit_message_text(
-        f"نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟",
+        f"📌 نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟",
         reply_markup=markup,
     )
 
@@ -315,7 +334,14 @@ async def on_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🕒 زمان: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         ]
         msg = "\n".join([x for x in lines if x is not None])
-        buttons = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")]]
+        # Add back buttons based on navigation history
+        back_buttons = []
+        if state.get("search_query"):
+            back_buttons.append([InlineKeyboardButton("🔙 بازگشت به نتایج جستجو", callback_data="nav:search_results")])
+        if state.get("exchange_id") and state.get("symbols"):
+            back_buttons.append([InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")])
+        back_buttons.append([InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="menu:home")])
+        buttons = back_buttons if back_buttons else [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")]]
         await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
     elif action == "chart":
         state["awaiting"] = "chart_params_count"
@@ -443,6 +469,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         
         # Show results
+        state["search_results"] = results[:20]  # Save results for back navigation
+        state["search_query"] = query_text
+        _persist_user_state(update.effective_user.id)
+        
         rows = []
         for r in results[:20]:  # Show max 20 results
             ex_name = parse_exchange_id(r["exchange_id"])
@@ -503,6 +533,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await on_excel_tf_selected(update, context)
     elif data.startswith("rng:excel:"):
         await on_excel_range_quick(update, context)
+    elif data.startswith("nav:search_results"):
+        await on_show_search_results(update, context)
     elif data == "noop":
         await query.answer(" ", show_alert=False)
 
@@ -629,9 +661,20 @@ async def _show_symbol_menu(update: Update, exchange_id: str, symbol: str) -> No
         [InlineKeyboardButton("📈 رسم نمودار", callback_data="act:chart")],
         [InlineKeyboardButton("📥 دریافت اکسل", callback_data="act:excel")],
         [InlineKeyboardButton("⭐ افزودن به علاقه‌مندی‌ها", callback_data="fav:add")],
-        [InlineKeyboardButton("⭐ پنل من", callback_data="panel:open")],
-        [InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")],
+        [InlineKeyboardButton("⭐ لیست علاقه‌مندی‌ها", callback_data="panel:open")],
     ]
+    
+    # Add back buttons based on navigation history
+    back_buttons = []
+    if state.get("search_query"):
+        # Came from search
+        back_buttons.append([InlineKeyboardButton("🔙 بازگشت به نتایج جستجو", callback_data="nav:search_results")])
+    if state.get("exchange_id") and state.get("symbols"):
+        # Came from exchange symbols list
+        back_buttons.append([InlineKeyboardButton("🔙 بازگشت به فهرست نمادها", callback_data=f"sympage:{exchange_id}:{state.get('sym_page','0')}")])
+    back_buttons.append([InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="menu:home")])
+    
+    buttons.extend(back_buttons)
     markup = InlineKeyboardMarkup(buttons)
     text = f"📌 نماد انتخاب‌شده: {symbol}\nچه کاری انجام دهم؟"
     # Support both callback_query and message
@@ -699,6 +742,32 @@ async def on_search_request(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     _persist_user_state(user_id)
     await query.edit_message_text(
         "🔍 نام رمز ارز را وارد کنید:\n\nمثال: همستر، btc، اتریوم و...\n\n(می‌توانید نام فارسی یا انگلیسی را وارد کنید)"
+    )
+
+
+async def on_show_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show search results again from navigation"""
+    query = update.callback_query
+    await query.answer()
+    state = _get_user_state(query.from_user.id)
+    results = state.get("search_results", [])
+    query_text = state.get("search_query", "")
+    
+    if not results:
+        await query.edit_message_text("❌ نتایج جستجو یافت نشد. لطفاً دوباره جستجو کنید.")
+        return
+    
+    rows = []
+    for r in results[:20]:
+        ex_name = parse_exchange_id(r["exchange_id"])
+        label = f"🪙 {r['symbol']} @ {ex_name} — {r['price_human']} $"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sym:{r['exchange_id']}:{r['symbol']}")])
+    
+    rows.append([InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu:home")])
+    markup = InlineKeyboardMarkup(rows)
+    await query.edit_message_text(
+        f"✅ {len(results)} نتیجه برای '{query_text}' یافت شد:\n\nیکی را انتخاب کنید:",
+        reply_markup=markup
     )
 
 
