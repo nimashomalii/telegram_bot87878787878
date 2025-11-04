@@ -4,7 +4,7 @@ from typing import Optional
 
 import requests
 
-from .exchange_utils import PERSIAN_BASES, USD_STABLES, parse_exchange_id
+from exchange_utils import PERSIAN_BASES, USD_STABLES, parse_exchange_id
 
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
@@ -71,5 +71,6 @@ async def get_coin_details(exchange_id: str, symbol: str) -> str:
     if cg_text:
         text += "\n" + cg_text
     return text
+
 
 
